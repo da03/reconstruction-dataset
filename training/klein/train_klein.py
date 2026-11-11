@@ -486,11 +486,10 @@ def main():
             k = max(1, int(0.1 * bg.shape[1]))
             loss = loss + a.topbg * torch.topk(bg, k, dim=1).values.mean()
         if with_x0:
-            # the image the prediction implies, against the true latent: a
-            # fit measure that is well conditioned at every noise level
-            # (the v target itself blows up as sigma -> 0, so the v loss has
-            # a floor near 1 at the least-noisy fixed points however good
-            # the fit; that floor is what keeps fixed_train from reaching 0)
+            # The implied clean latent error weights velocity error by sigma^2.
+            # The velocity target is noise - clean and does not diverge at
+            # small sigma. Neither loss has an unavoidable floor near one.
+            # Use overfit.py for fixed-frame/noise/sigma memorization checks.
             x0_hat = P._pack_latents(noisy) - float(sigma) * pred.float()
             x0_err = ((x0_hat - P._pack_latents(tgt.float())) ** 2).mean()
             return loss, x0_err

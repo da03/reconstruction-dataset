@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""Fit fixed frames before scaling data. Run with torchrun for multiple GPUs.
+
+One lineage, four gated stages: fixed frame/noise/sigma; fresh noise;
+multiple sigmas; five frames. Stage transitions retain this run's weights
+and Adam state. Initialization is the named foundation checkpoint plus fresh
+LoRA weights. No task-trained adapter is loaded on a fresh launch.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+from datetime import timedelta
+import hashlib
+import importlib.metadata
+import json
+import os
+from pathlib import Path
+import random
+import re
+import signal
+import time
+
+import numpy as np
+import torch
+import torch.distributed as dist
+
+from checkpointing import (atomic_json, digest, load_checkpoint, restore_rng,
+                           restore_trainable, rng_state, save_checkpoint, trainable_state)
+from render import BASE, PROMPT, Codec, attention_bias, part_ids_from_map, substrate_image
+from train_klein import Frames
+
+STAGES = ('one_fixed', 'one_fresh_noise', 'one_sigma_grid', 'five_sigma_grid')
+
+
+def sigma_grid(text):
+    values = [float(v) for v in text.split(',')]
+    if not values or any(not 0 < v <= 1 for v in values):
+        raise ValueError('Every sigma must be in (0, 1]')
+    return values
+
+
+def training_case(stage, step, rank, world, frames, sigmas):
+    """Enumerate the complete frame-by-sigma product across all ranks."""
+    position = step * world + rank
+    if stage < 2:
+        return 0, .5
+    frame_count = frames if stage == 3 else 1
+    position %= frame_count * len(sigmas)
+    return position // len(sigmas), sigmas[position % len(sigmas)]
+
+
+def evaluate_checkpoint(path, evaluate):
+    """A failed evaluation leaves its committed training checkpoint intact."""
+    path = Path(path)
+    result_path = path / 'evaluation.json'
+    if result_path.exists():
+        return json.loads(result_path.read_text())
+    result = evaluate()
+    atomic_json(result_path, result)
+    return result
+
+
+def flow_loss(pred, clean, noise, sigma):
+    target = noise - clean
+    v = (pred.float() - target.float()).square().mean()
+    noisy = (1 - sigma) * clean.float() + sigma * noise.float()
+    x0 = (noisy - sigma * pred.float() - clean.float()).square().mean()
+    return v, x0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--data', required=True)
+    ap.add_argument('--out', required=True)
+    ap.add_argument('--model', default=BASE)
+    ap.add_argument('--revision', required=True, help='Immutable foundation model revision')
+    ap.add_argument('--object', required=True)
+    ap.add_argument('--variant', type=int, default=0)
+    ap.add_argument('--frames', type=int, default=5)
+    ap.add_argument('--res', type=int, default=512)
+    ap.add_argument('--rank', type=int, default=128)
+    ap.add_argument('--alpha', type=int, default=32)
+    ap.add_argument('--lr', type=float, default=1e-4)
+    ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--sigmas', type=sigma_grid, default=sigma_grid('0.1,0.25,0.5,0.75,0.9'))
+    ap.add_argument('--budgets', default='2000,4000,6000,10000')
+    ap.add_argument('--threshold', type=float, default=1e-3,
+                    help='Maximum per-case velocity MSE required to advance a stage')
+    ap.add_argument('--eval-every', type=int, default=100)
+    ap.add_argument('--resume', action='store_true')
+    ap.add_argument('--preflight', action='store_true', help='Check selected files without loading a model')
+    a = ap.parse_args()
+    if not re.fullmatch(r'[0-9a-f]{40}', a.revision):
+        raise ValueError('Use a full immutable foundation commit SHA')
+    budgets = [int(n) for n in a.budgets.split(',')]
+    if len(budgets) != 4 or min(budgets) < 1 or a.frames != 5 or a.eval_every < 1:
+        raise ValueError('Expected four positive budgets, five frames and positive evaluation interval')
+    local_rank, rank, world = int(os.getenv('LOCAL_RANK', '0')), int(os.getenv('RANK', '0')), int(os.getenv('WORLD_SIZE', '1'))
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    lock = None
+    if rank == 0:
+        lock = (out / '.training.lock').open('a')
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    ds = Frames(a.data, 'train', [a.object], 3, a.res,
+                '%d-%d' % (a.variant, a.variant), max_frames=a.frames)
+    if len(ds.rows) != a.frames:
+        raise ValueError('Need exactly five selected training frames')
+    if not ds.objects[a.object].get('n_parts'):
+        raise ValueError('This recipe requires a positive n_parts')
+    files = set()
+    for row in ds.rows:
+        files.update(row[k] for k in ('tgt', 'ppr', 'mask'))
+        refs, ids = ds.ref_files(row, with_ids=True)
+        if any(p is None for p in ids):
+            raise ValueError('Part-label maps are required by this recipe')
+        files.update(refs + ids)
+    manifest = dict(object=a.object, variant=a.variant, frames=ds.rows,
+                    files={p: digest(Path(a.data)/p) for p in sorted(files)})
+    manifest_path = out / 'data_manifest.json'
+    if manifest_path.exists() and json.loads(manifest_path.read_text()) != manifest:
+        raise ValueError('Selected training data changed')
+    if rank == 0:
+        atomic_json(manifest_path, manifest)
+    if a.preflight:
+        print(json.dumps(dict(preflight='passed', frames=len(ds.rows), files=len(files))), flush=True)
+        return
+    config_record = {k:v for k,v in vars(a).items() if k not in ('resume','preflight')}
+    config_record['world_size'] = world
+    config_record['versions'] = {
+        k:importlib.metadata.version(k) for k in ('torch','diffusers','peft','transformers')}
+    latest = out/'checkpoints/latest.json'
+    if not a.resume and latest.exists():
+        raise ValueError('Output already has a checkpoint; use --resume')
+    if a.resume and not latest.exists():
+        raise ValueError('Cannot resume without a complete checkpoint')
+    if (out/'config.json').exists():
+        if json.loads((out/'config.json').read_text()) != config_record:
+            raise ValueError('Configuration differs from the existing run')
+    elif rank == 0:
+        atomic_json(out/'config.json',config_record)
+    torch.cuda.set_device(local_rank)
+    dev, dtype = torch.device('cuda', local_rank), torch.bfloat16
+    if world > 1:
+        dist.init_process_group('nccl', timeout=timedelta(hours=2))
+    torch.manual_seed(a.seed)
+    random.seed(a.seed)
+    np.random.seed(a.seed)
+    from diffusers import Flux2KleinPipeline
+    from peft import LoraConfig
+    pipe = Flux2KleinPipeline.from_pretrained(a.model, revision=a.revision, torch_dtype=dtype)
+    pipe.text_encoder.to(dev)
+    with torch.no_grad():
+        pe, tids = pipe.encode_prompt(prompt=PROMPT, device=dev, max_sequence_length=512)
+    pipe.text_encoder.to('cpu')
+    del pipe.text_encoder
+    torch.cuda.empty_cache()
+    pipe.vae.to(dev).eval().requires_grad_(False)
+    model = pipe.transformer.to(dev).requires_grad_(False)
+    config = LoraConfig(r=a.rank, lora_alpha=a.alpha, init_lora_weights='gaussian',
+        target_modules=['to_k','to_q','to_v','to_out.0','to_qkv_mlp_proj'] +
+        [f'single_transformer_blocks.{i}.attn.to_out' for i in range(len(model.single_transformer_blocks))])
+    model.add_adapter(config)
+    trainable = {n:p for n,p in model.named_parameters() if p.requires_grad}
+    if not trainable or any('lora_' not in n for n in trainable):
+        raise ValueError('Expected fresh LoRA parameters only')
+    for name, param in trainable.items():
+        if 'lora_B' in name and torch.count_nonzero(param).item():
+            raise ValueError('LoRA B must be zero at fresh initialization')
+        if 'lora_A' in name and not torch.count_nonzero(param).item():
+            raise ValueError('LoRA A must have fresh random initialization')
+    params = list(trainable.values())
+    for p in params:
+        p.data = p.data.float()
+        if world > 1:
+            dist.broadcast(p.data, 0)
+    model.enable_gradient_checkpointing()
+    optimizer = torch.optim.AdamW(params, lr=a.lr, weight_decay=0)
+    codec = Codec(pipe, dev, dtype)
+    P = codec.P
+    cache = []
+    for i in range(a.frames):
+        item = ds.item(i, rng=None)
+        clean = codec.encode(item['target'])
+        pack = codec.encode(item['ctx'][0])
+        refs = [codec.encode(im) for im in item['ctx'][1:]]
+        h, w = clean.shape[-2:]
+        n = item['n_parts']
+        ids = codec.target_ids(clean, item['ctx'][0], n)
+        labels = [part_ids_from_map(im,h,w,0,n) for im in item['ref_ids']]
+        sub = codec.encode(substrate_image(item['ctx'][0],item['ctx'][1:],item['ref_ids'],n))
+        ctx, ci = codec.context(pack,refs,ids,'aligned',labels,[sub])
+        bias = attention_bias(part_ids_from_map(item['ctx'][0],h,w,2,n)[0],
+                              [x[0] for x in labels],pe.shape[1],2,device=dev,dtype=dtype)
+        cache.append(dict(clean=P._pack_latents(clean).float(), ids=torch.cat([ids,ci],1),
+                          ctx=ctx, bias=bias, h=h, w=w))
+        if rank == 0:
+            item['target'].save(out/f'target_{i}.png')
+            codec.decode(cache[-1]['clean'],h,w).save(out/f'vae_roundtrip_{i}.png')
+    # Separate generators: validation never changes the optimization RNG stream.
+    fixed = torch.Generator(device=dev).manual_seed(a.seed+12345)
+    fixed_noise = torch.randn(cache[0]['clean'].shape,generator=fixed,device=dev)
+    noise_rng = torch.Generator(device=dev).manual_seed(a.seed+1000+rank)
+    if rank == 0 and not a.resume:
+        atomic_json(out/'initialization.json',dict(model=a.model,revision=a.revision,
+            task_parameters='fresh Gaussian LoRA A and verified zero LoRA B',
+            trainable=sum(p.numel() for p in params),
+            adapter_tensor_sha256={n:hashlib.sha256(
+                p.detach().float().cpu().numpy().tobytes()).hexdigest()
+                for n,p in trainable.items()},
+            versions={k:importlib.metadata.version(k) for k in ('torch','diffusers','peft','transformers')}))
+    stage, stage_step, total, pending, cp = 0, 0, 0, True, None
+    if a.resume:
+        state, cp = load_checkpoint(out/'checkpoints')
+        if state['config'] != config_record or state['manifest'] != manifest:
+            raise ValueError('Resume configuration or data differs from checkpoint')
+        restore_trainable(model,state['weights'])
+        optimizer.load_state_dict(state['optimizer'])
+        stage,stage_step,total,pending=state['stage'],state['stage_step'],state['total'],state['pending_eval']
+        restore_rng(state['ranks'][rank]['rng'])
+        noise_rng.set_state(state['ranks'][rank]['noise_rng'].cpu())
+        print(f'RESTORED rank={rank} step={total} stage={stage} optimizer_states={len(optimizer.state)}',flush=True)
+    stopping = [False]
+    def stop(_sig,_frame): stopping[0]=True
+    signal.signal(signal.SIGUSR1,stop)
+    signal.signal(signal.SIGTERM,stop)
+
+    def predict(case, noise, sigma):
+        noisy=(1-sigma)*case['clean']+sigma*noise
+        with torch.autocast('cuda',dtype=dtype):
+            result=model(hidden_states=torch.cat([noisy.to(dtype),case['ctx']],1),
+                timestep=torch.tensor([sigma],device=dev),encoder_hidden_states=pe,
+                txt_ids=tids,img_ids=case['ids'],joint_attention_kwargs={'attention_mask':case['bias']},
+                return_dict=False)[0]
+        return result[:,:noisy.shape[1]]
+
+    def commit():
+        nonlocal cp
+        rs=dict(rng=rng_state(),noise_rng=noise_rng.get_state())
+        ranks=[None]*world
+        if world>1: dist.all_gather_object(ranks,rs)
+        else: ranks=[rs]
+        if rank==0:
+            cp=save_checkpoint(out/'checkpoints',total,dict(weights=trainable_state(model),
+                optimizer=optimizer.state_dict(),ranks=ranks,config=config_record,manifest=manifest,
+                stage=stage,stage_step=stage_step,total=total,pending_eval=pending))
+        names=[str(cp) if rank==0 else None]
+        if world>1: dist.broadcast_object_list(names,src=0)
+        cp=Path(names[0])
+
+    def evaluate():
+        model.eval()
+        cases=[]
+        count=5 if stage==3 else 1
+        sigmas=[.5] if stage<2 else a.sigmas
+        with torch.no_grad():
+            for i in range(count):
+                c=cache[i]
+                for sigma in sigmas:
+                    for seed in ([0] if stage==0 else [0,1,2,3]):
+                        gen=torch.Generator(device=dev).manual_seed(20000+i*10+seed)
+                        noise=fixed_noise if stage==0 else torch.randn(c['clean'].shape,generator=gen,device=dev)
+                        pred=predict(c,noise,sigma)
+                        v,x0=flow_loss(pred,c['clean'],noise,sigma)
+                        if seed == 0 and sigma == .5:
+                            noisy=(1-sigma)*c['clean']+sigma*noise
+                            codec.decode(noisy-sigma*pred.float(),c['h'],c['w']).save(
+                                cp/f'frame_{i}_one_step_x0.png')
+                        cases.append(dict(frame=i,sigma=sigma,seed=seed,v_mse=float(v),x0_mse=float(x0)))
+        model.train()
+        return dict(stage=STAGES[stage],step=total,stage_step=stage_step,cases=cases,
+                    mean_v=float(np.mean([c['v_mse'] for c in cases])),
+                    max_v=max(c['v_mse'] for c in cases))
+
+    def evaluate_committed():
+        result=[None]
+        if rank==0:
+            result[0]=evaluate_checkpoint(cp,evaluate)
+            with (out/'evaluations.jsonl').open('a') as f: f.write(json.dumps(result[0])+'\n')
+            print('EVAL '+json.dumps({k:v for k,v in result[0].items() if k!='cases'}),flush=True)
+        if world>1: dist.broadcast_object_list(result,src=0)
+        return result[0]
+
+    model.train()
+    if cp is None: commit()
+    started=time.monotonic()
+    while stage<len(STAGES):
+        if pending:
+            result=evaluate_committed()
+            pending=False
+            if stage_step and result['max_v']<=a.threshold:
+                if rank==0:
+                    atomic_json(out/(STAGES[stage]+'_passed.json'),result)
+                stage+=1; stage_step=0
+                pending=stage<len(STAGES)
+                commit()
+                if pending: continue
+                break
+            if stage_step>=budgets[stage]:
+                if rank==0:
+                    atomic_json(out/'status.json',dict(status='stopped_at_budget',stage=STAGES[stage],step=total,
+                        max_v=result['max_v'],threshold=a.threshold))
+                break
+        halt=torch.tensor(int(stopping[0]),device=dev)
+        if world>1: dist.all_reduce(halt,op=dist.ReduceOp.MAX)
+        if halt.item():
+            commit()
+            if rank==0: atomic_json(out/'status.json',dict(status='stopped_for_signal',step=total))
+            break
+        i,sigma=training_case(stage,stage_step,rank,world,a.frames,a.sigmas)
+        c=cache[i]
+        noise=fixed_noise if stage==0 else torch.randn(c['clean'].shape,generator=noise_rng,device=dev)
+        optimizer.zero_grad(set_to_none=True)
+        pred=predict(c,noise,sigma)
+        loss,_=flow_loss(pred,c['clean'],noise,sigma)
+        if not torch.isfinite(loss): raise FloatingPointError('Non-finite loss')
+        loss.backward()
+        for p in params:
+            if p.grad is None: raise RuntimeError('Missing adapter gradient')
+            if world>1:
+                dist.all_reduce(p.grad)
+                p.grad.div_(world)
+        norm=torch.nn.utils.clip_grad_norm_(params,1.0,error_if_nonfinite=True)
+        samples=[p.detach().flatten()[::max(1,p.numel()//64)].clone() for p in params]
+        optimizer.step()
+        delta=float(torch.stack([(p.detach().flatten()[::max(1,p.numel()//64)]-old).square().sum()
+                  for p,old in zip(params,samples)]).sum().sqrt())
+        total+=1; stage_step+=1
+        if rank==0 and (total<=5 or total%10==0):
+            row=dict(step=total,stage=STAGES[stage],stage_step=stage_step,loss=float(loss.detach()),
+                     frame=i,sigma=sigma,grad_norm=float(norm),sampled_parameter_delta=delta,lr=a.lr,
+                     elapsed=time.monotonic()-started,gpu=torch.cuda.get_device_name(dev))
+            with (out/'train.jsonl').open('a') as f: f.write(json.dumps(row)+'\n')
+            print('TRAIN '+json.dumps(row),flush=True)
+        if stage_step%a.eval_every==0 or stage_step==budgets[stage]:
+            pending=True
+            commit()  # Evaluation must never precede a complete resumable save.
+    if stage==len(STAGES) and rank==0:
+        atomic_json(out/'status.json',dict(status='all_stages_passed',step=total))
+    if world>1: dist.destroy_process_group()
+
+
+if __name__=='__main__':
+    main()
