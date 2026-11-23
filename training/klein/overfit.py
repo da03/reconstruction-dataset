@@ -29,6 +29,7 @@ from checkpointing import (atomic_json, digest, load_checkpoint, restore_rng,
                            restore_trainable, rng_state, save_checkpoint, trainable_state)
 from render import BASE, PROMPT, Codec, attention_bias, part_ids_from_map, substrate_image
 from train_klein import Frames
+from overfit_runtime import adapter_config, cache_case, predict_velocity
 
 STAGES = ('one_fixed', 'one_fresh_noise', 'one_sigma_grid', 'five_sigma_grid')
 
@@ -148,7 +149,6 @@ def main():
     random.seed(a.seed)
     np.random.seed(a.seed)
     from diffusers import Flux2KleinPipeline
-    from peft import LoraConfig
     pipe = Flux2KleinPipeline.from_pretrained(a.model, revision=a.revision, torch_dtype=dtype)
     pipe.text_encoder.to(dev)
     with torch.no_grad():
@@ -158,9 +158,7 @@ def main():
     torch.cuda.empty_cache()
     pipe.vae.to(dev).eval().requires_grad_(False)
     model = pipe.transformer.to(dev).requires_grad_(False)
-    config = LoraConfig(r=a.rank, lora_alpha=a.alpha, init_lora_weights='gaussian',
-        target_modules=['to_k','to_q','to_v','to_out.0','to_qkv_mlp_proj'] +
-        [f'single_transformer_blocks.{i}.attn.to_out' for i in range(len(model.single_transformer_blocks))])
+    config = adapter_config(model, a.rank, a.alpha)
     model.add_adapter(config)
     trainable = {n:p for n,p in model.named_parameters() if p.requires_grad}
     if not trainable or any('lora_' not in n for n in trainable):
@@ -182,22 +180,10 @@ def main():
     cache = []
     for i in range(a.frames):
         item = ds.item(i, rng=None)
-        clean = codec.encode(item['target'])
-        pack = codec.encode(item['ctx'][0])
-        refs = [codec.encode(im) for im in item['ctx'][1:]]
-        h, w = clean.shape[-2:]
-        n = item['n_parts']
-        ids = codec.target_ids(clean, item['ctx'][0], n)
-        labels = [part_ids_from_map(im,h,w,0,n) for im in item['ref_ids']]
-        sub = codec.encode(substrate_image(item['ctx'][0],item['ctx'][1:],item['ref_ids'],n))
-        ctx, ci = codec.context(pack,refs,ids,'aligned',labels,[sub])
-        bias = attention_bias(part_ids_from_map(item['ctx'][0],h,w,2,n)[0],
-                              [x[0] for x in labels],pe.shape[1],2,device=dev,dtype=dtype)
-        cache.append(dict(clean=P._pack_latents(clean).float(), ids=torch.cat([ids,ci],1),
-                          ctx=ctx, bias=bias, h=h, w=w))
+        cache.append(cache_case(codec, item, pe.shape[1]))
         if rank == 0:
             item['target'].save(out/f'target_{i}.png')
-            codec.decode(cache[-1]['clean'],h,w).save(out/f'vae_roundtrip_{i}.png')
+            codec.decode(cache[-1]['clean'],cache[-1]['h'],cache[-1]['w']).save(out/f'vae_roundtrip_{i}.png')
     # Separate generators: validation never changes the optimization RNG stream.
     fixed = torch.Generator(device=dev).manual_seed(a.seed+12345)
     fixed_noise = torch.randn(cache[0]['clean'].shape,generator=fixed,device=dev)
@@ -228,12 +214,7 @@ def main():
 
     def predict(case, noise, sigma):
         noisy=(1-sigma)*case['clean']+sigma*noise
-        with torch.autocast('cuda',dtype=dtype):
-            result=model(hidden_states=torch.cat([noisy.to(dtype),case['ctx']],1),
-                timestep=torch.tensor([sigma],device=dev),encoder_hidden_states=pe,
-                txt_ids=tids,img_ids=case['ids'],joint_attention_kwargs={'attention_mask':case['bias']},
-                return_dict=False)[0]
-        return result[:,:noisy.shape[1]]
+        return predict_velocity(model,case,noisy,sigma,pe,tids,dtype)
 
     def commit():
         nonlocal cp

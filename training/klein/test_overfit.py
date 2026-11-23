@@ -11,9 +11,39 @@ import torch
 
 import checkpointing as ck
 from overfit import evaluate_checkpoint, flow_loss, training_case
+from overfit_runtime import euler_sample, predict_velocity
 
 
 class OverfitTests(unittest.TestCase):
+    def test_sampling_starts_from_reproducible_pure_noise(self):
+        seen = []
+        def velocity(x, sigma):
+            seen.append((x.clone(), sigma))
+            return torch.ones_like(x)
+        shape = (1, 4, 8)
+        out = euler_sample(velocity, shape, [1, .75, .25, 0], 19, 'cpu')
+        initial = torch.randn(shape, generator=torch.Generator().manual_seed(19))
+        torch.testing.assert_close(seen[0][0], initial, rtol=0, atol=0)
+        torch.testing.assert_close(out, initial-1)
+        self.assertEqual([s for _,s in seen], [1, .75, .25])
+        for schedule in ([.9, 0], [1, .5], [1, .5, .6, 0]):
+            with self.assertRaises(ValueError):
+                euler_sample(velocity, shape, schedule, 19, 'cpu')
+
+    def test_predict_uses_current_latent_and_condition_without_clean_target(self):
+        captured = {}
+        def model(**kw):
+            captured.update(kw)
+            return (kw['hidden_states']*2,)
+        x = torch.randn(1, 3, 4)
+        case = dict(ctx=torch.randn(1, 2, 4),ids=torch.zeros(1, 5, 4),
+                    bias=torch.zeros(1, 1, 6, 6))
+        pred = predict_velocity(model,case,x,.25,torch.ones(1,1,4),
+                                torch.zeros(1,1,4),torch.float32)
+        torch.testing.assert_close(pred,2*x,rtol=0,atol=0)
+        torch.testing.assert_close(captured['hidden_states'][:,3:],case['ctx'])
+        self.assertEqual(captured['timestep'].item(),.25)
+
     def test_every_frame_sees_every_sigma(self):
         sigmas = [.1, .25, .5, .75, .9]
         for world in (1, 2, 3, 5):

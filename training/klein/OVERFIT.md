@@ -76,6 +76,25 @@ for inspection. The one-step estimates start from a noised training target;
 they are not samples generated from pure noise. A successful loss check does
 not establish visual generation quality or real-time performance.
 
+`diagnose_overfit.py` restores a committed native checkpoint with the same
+foundation revision, adapter configuration, hashed data, and conditioning.
+It samples from pure Gaussian noise using the renderer's shifted Euler schedule
+and reports latent and image errors against the target and its VAE reconstruction:
+
+```sh
+python training/klein/diagnose_overfit.py --checkpoint "$CHECKPOINT" \
+  --data "$DATA" --out "$DIAGNOSTICS" --frames 1 --steps 32 --seeds 0,1,2 \
+  --precision-check
+```
+
+No optimizer updates occur. The precision check compares BF16 arithmetic,
+FP32 arithmetic with rounded BF16 inputs, and FP32 arithmetic with unrounded
+inputs, holding encoded conditioning and saved weight values fixed. It also
+measures rounded-input and rounded-output oracle errors. These are numerical
+diagnostics, not claims that the trained model achieves an oracle's error.
+Sampling includes sigma=1 and intermediate noise levels absent from the five-point
+training grid; report sampling quality separately from grid-point training fit.
+
 The velocity objective is `v = noise - clean`, with
 `noisy = (1 - sigma) * clean + sigma * noise`. A memorized target permits zero
 velocity error; there is no unavoidable floor near one. Clean-latent MSE equals
