@@ -51,7 +51,7 @@ def digest(path):
     return h.hexdigest()
 
 
-def save_checkpoint(root, step, state):
+def save_checkpoint(root, step, state, before_publish=None):
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     name = 'step_%09d_%s' % (step, uuid.uuid4().hex[:8])
@@ -64,6 +64,8 @@ def save_checkpoint(root, step, state):
         os.fsync(f.fileno())
     sha = digest(payload)
     atomic_json(staging / 'manifest.json', dict(step=step, sha256=sha, bytes=payload.stat().st_size))
+    if before_publish is not None:
+        before_publish()
     final = root / name
     os.replace(staging, final)
     atomic_json(root / 'latest.json', dict(directory=name, step=step))

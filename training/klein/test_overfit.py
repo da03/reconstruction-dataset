@@ -10,11 +10,36 @@ import numpy as np
 import torch
 
 import checkpointing as ck
-from overfit import evaluate_checkpoint, flow_loss, training_case
+from overfit import check_authority, evaluate_checkpoint, flow_loss, training_case, validate_continuation
 from overfit_runtime import euler_sample, predict_velocity
 
 
 class OverfitTests(unittest.TestCase):
+    def test_continuation_changes_paths_and_budgets_without_changing_recipe(self):
+        old = dict(data='old_data',out='old_out',budgets='2,4,6,10',lr=.001,world_size=2)
+        new = dict(old,data='new_data',out='new_out',budgets='2,4,16,20')
+        validate_continuation(old,new)
+        for changed in (dict(new,lr=.002),dict(new,world_size=1),dict(new,budgets='2,4,5,20')):
+            with self.assertRaises(ValueError):
+                validate_continuation(old,changed)
+
+    def test_revoked_authority_prevents_checkpoint_publication(self):
+        with tempfile.TemporaryDirectory() as root:
+            p=Path(root)/'grant.json'
+            ck.atomic_json(p,dict(generation=3,selected_job='123',release_training=True))
+            guard=lambda:check_authority(p,3,'123')
+            guard()
+            first=ck.save_checkpoint(Path(root)/'checkpoints',1,{'step':1},before_publish=guard)
+            for grant in (dict(generation=4,selected_job='123',release_training=True),
+                          dict(generation=3,selected_job='124',release_training=True),
+                          dict(generation=3,selected_job='123',release_training=False)):
+                ck.atomic_json(p,grant)
+                with self.assertRaises(RuntimeError):
+                    ck.save_checkpoint(Path(root)/'checkpoints',2,{'step':2},before_publish=guard)
+                state,path=ck.load_checkpoint(Path(root)/'checkpoints')
+                self.assertEqual(state['step'],1)
+                self.assertEqual(path,first)
+
     def test_sampling_starts_from_reproducible_pure_noise(self):
         seen = []
         def velocity(x, sigma):

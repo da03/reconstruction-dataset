@@ -34,6 +34,28 @@ from overfit_runtime import adapter_config, cache_case, predict_velocity
 STAGES = ('one_fixed', 'one_fresh_noise', 'one_sigma_grid', 'five_sigma_grid')
 
 
+def validate_continuation(previous, current):
+    """Relocation and larger update budgets preserve the scientific recipe."""
+    ignored = {'data', 'out', 'budgets'}
+    if {k:v for k,v in previous.items() if k not in ignored} != {
+            k:v for k,v in current.items() if k not in ignored}:
+        raise ValueError('Continuation changed the training recipe')
+    old = [int(n) for n in previous['budgets'].split(',')]
+    new = [int(n) for n in current['budgets'].split(',')]
+    if len(old) != 4 or len(new) != 4 or any(b < a for a,b in zip(old,new)):
+        raise ValueError('Continuation budgets must not decrease')
+
+
+def check_authority(path, generation, job):
+    if not path:
+        return
+    grant = json.loads(Path(path).read_text())
+    if not (grant.get('release_training') is True and
+            grant.get('generation') == generation and
+            grant.get('selected_job') == job and job):
+        raise RuntimeError('Training authority was revoked or belongs to another job')
+
+
 def sigma_grid(text):
     values = [float(v) for v in text.split(',')]
     if not values or any(not 0 < v <= 1 for v in values):
@@ -90,8 +112,18 @@ def main():
                     help='Maximum per-case velocity MSE required to advance a stage')
     ap.add_argument('--eval-every', type=int, default=100)
     ap.add_argument('--resume', action='store_true')
+    ap.add_argument('--resume-from', help='Continue full native state into a new output directory')
+    ap.add_argument('--authority-file', help='Atomic job-specific grant checked before batches and saves')
+    ap.add_argument('--authority-generation', type=int)
     ap.add_argument('--preflight', action='store_true', help='Check selected files without loading a model')
     a = ap.parse_args()
+    if a.resume and a.resume_from:
+        ap.error('--resume and --resume-from are mutually exclusive')
+    if bool(a.authority_file) != (a.authority_generation is not None):
+        ap.error('Provide both authority-file and authority-generation')
+    def guard():
+        check_authority(a.authority_file,a.authority_generation,os.getenv('SLURM_JOB_ID'))
+    guard()
     if not re.fullmatch(r'[0-9a-f]{40}', a.revision):
         raise ValueError('Use a full immutable foundation commit SHA')
     budgets = [int(n) for n in a.budgets.split(',')]
@@ -127,11 +159,14 @@ def main():
     if a.preflight:
         print(json.dumps(dict(preflight='passed', frames=len(ds.rows), files=len(files))), flush=True)
         return
-    config_record = {k:v for k,v in vars(a).items() if k not in ('resume','preflight')}
+    config_record = {k:v for k,v in vars(a).items() if k not in (
+        'resume','resume_from','preflight','authority_file','authority_generation')}
     config_record['world_size'] = world
     config_record['versions'] = {
         k:importlib.metadata.version(k) for k in ('torch','diffusers','peft','transformers')}
     latest = out/'checkpoints/latest.json'
+    if a.resume_from and (latest.exists() or (out/'config.json').exists()):
+        raise ValueError('--resume-from requires a new output directory')
     if not a.resume and latest.exists():
         raise ValueError('Output already has a checkpoint; use --resume')
     if a.resume and not latest.exists():
@@ -188,7 +223,7 @@ def main():
     fixed = torch.Generator(device=dev).manual_seed(a.seed+12345)
     fixed_noise = torch.randn(cache[0]['clean'].shape,generator=fixed,device=dev)
     noise_rng = torch.Generator(device=dev).manual_seed(a.seed+1000+rank)
-    if rank == 0 and not a.resume:
+    if rank == 0 and not (a.resume or a.resume_from):
         atomic_json(out/'initialization.json',dict(model=a.model,revision=a.revision,
             task_parameters='fresh Gaussian LoRA A and verified zero LoRA B',
             trainable=sum(p.numel() for p in params),
@@ -197,15 +232,29 @@ def main():
                 for n,p in trainable.items()},
             versions={k:importlib.metadata.version(k) for k in ('torch','diffusers','peft','transformers')}))
     stage, stage_step, total, pending, cp = 0, 0, 0, True, None
-    if a.resume:
-        state, cp = load_checkpoint(out/'checkpoints')
-        if state['config'] != config_record or state['manifest'] != manifest:
+    continuation = None
+    if a.resume or a.resume_from:
+        state, cp = load_checkpoint(a.resume_from or out/'checkpoints')
+        if a.resume_from:
+            validate_continuation(state['config'],config_record)
+        elif state['config'] != config_record:
+            raise ValueError('Resume configuration differs from checkpoint')
+        if state['manifest'] != manifest:
             raise ValueError('Resume configuration or data differs from checkpoint')
         restore_trainable(model,state['weights'])
         optimizer.load_state_dict(state['optimizer'])
         stage,stage_step,total,pending=state['stage'],state['stage_step'],state['total'],state['pending_eval']
         restore_rng(state['ranks'][rank]['rng'])
         noise_rng.set_state(state['ranks'][rank]['noise_rng'].cpu())
+        continuation = state.get('continuation')
+        if a.resume_from:
+            continuation = dict(source=str(cp), source_manifest=json.loads((cp/'manifest.json').read_text()),
+                previous_config=state['config'], config=config_record, previous=continuation)
+            if rank==0:
+                atomic_json(out/'continuation.json',continuation)
+            # Save restored native state here before evaluating or updating it.
+            cp=None
+            pending=True
         print(f'RESTORED rank={rank} step={total} stage={stage} optimizer_states={len(optimizer.state)}',flush=True)
     stopping = [False]
     def stop(_sig,_frame): stopping[0]=True
@@ -218,6 +267,7 @@ def main():
 
     def commit():
         nonlocal cp
+        guard()
         rs=dict(rng=rng_state(),noise_rng=noise_rng.get_state())
         ranks=[None]*world
         if world>1: dist.all_gather_object(ranks,rs)
@@ -225,7 +275,8 @@ def main():
         if rank==0:
             cp=save_checkpoint(out/'checkpoints',total,dict(weights=trainable_state(model),
                 optimizer=optimizer.state_dict(),ranks=ranks,config=config_record,manifest=manifest,
-                stage=stage,stage_step=stage_step,total=total,pending_eval=pending))
+                stage=stage,stage_step=stage_step,total=total,pending_eval=pending,
+                continuation=continuation),before_publish=guard)
         names=[str(cp) if rank==0 else None]
         if world>1: dist.broadcast_object_list(names,src=0)
         cp=Path(names[0])
@@ -267,6 +318,7 @@ def main():
     if cp is None: commit()
     started=time.monotonic()
     while stage<len(STAGES):
+        guard()
         if pending:
             result=evaluate_committed()
             pending=False
@@ -304,6 +356,7 @@ def main():
                 p.grad.div_(world)
         norm=torch.nn.utils.clip_grad_norm_(params,1.0,error_if_nonfinite=True)
         samples=[p.detach().flatten()[::max(1,p.numel()//64)].clone() for p in params]
+        guard()
         optimizer.step()
         delta=float(torch.stack([(p.detach().flatten()[::max(1,p.numel()//64)]-old).square().sum()
                   for p,old in zip(params,samples)]).sum().sqrt())

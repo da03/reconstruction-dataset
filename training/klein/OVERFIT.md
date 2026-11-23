@@ -49,6 +49,19 @@ versions, world size and data hashes must match. The output-directory lock
 prevents concurrent writers. Use one shared output directory for all workers
 of a run; independent copies of that directory do not coordinate training.
 
+To continue a completed diagnostic budget into a separate output directory,
+use `--resume-from "$CHECKPOINT"` and explicitly increase `--budgets`. This
+restores weights, Adam, all rank RNG streams and the exact stage cursor; it
+does not restart training or skip a failed gate. Data hashes, world size and
+scientific settings must match. Changed paths and increased budgets are recorded
+in `continuation.json`. Use `--resume` for later recovery of that continuation.
+
+Cluster launchers can provide `--authority-file` and `--authority-generation`.
+The JSON grant must authorize the current `SLURM_JOB_ID` with `selected_job`,
+`generation`, and `release_training=true`. Checks precede each batch, optimizer
+update and checkpoint publication. Cross-site launchers must coordinate these
+grants through one authority and isolate each successor's output directory.
+
 Each GPU processes one example per optimizer update, and gradients are averaged
 across GPUs. In the first stage both ranks deliberately use the same example,
 noise and sigma; the objective is unchanged by this duplicate computation.
