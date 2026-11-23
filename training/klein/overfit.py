@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Fit fixed frames before scaling data. Run with torchrun for multiple GPUs.
 
-One lineage, four gated stages: fixed frame/noise/sigma; fresh noise;
+One lineage, four stages gated by default: fixed frame/noise/sigma; fresh noise;
 multiple sigmas; five frames. Stage transitions retain this run's weights
 and Adam state. Initialization is the named foundation checkpoint plus fresh
 LoRA weights. No task-trained adapter is loaded on a fresh launch.
+An explicit advance after the one-frame budget preserves its failed gate.
 """
 from __future__ import annotations
 
@@ -44,6 +45,27 @@ def validate_continuation(previous, current):
     new = [int(n) for n in current['budgets'].split(',')]
     if len(old) != 4 or len(new) != 4 or any(b < a for a,b in zip(old,new)):
         raise ValueError('Continuation budgets must not decrease')
+
+
+def advance_after_budget(state, checkpoint):
+    """Start the requested five-frame stage without relabeling a failed gate."""
+    if state['stage'] != 2 or state['stage_step'] < int(state['config']['budgets'].split(',')[2]):
+        raise ValueError('Explicit stage advance requires an exhausted one-frame sigma stage')
+    result = json.loads((Path(checkpoint)/'evaluation.json').read_text())
+    if (result['stage'] != STAGES[2] or result['step'] != state['total'] or
+            result['stage_step'] != state['stage_step'] or
+            not np.isfinite(result['max_v']) or
+            result['max_v'] <= state['config']['threshold']):
+        raise ValueError('Expected the committed evaluation of the failed source gate')
+    return dict(stage=STAGES[2], step=state['total'], max_v=result['max_v'],
+                threshold=state['config']['threshold'], passed=False,
+                reason='Explicit advance to the five-frame experiment after the one-frame budget')
+
+
+def completion_status(continuation, total):
+    unpassed = (continuation or {}).get('unpassed_stages', [])
+    return dict(status='five_frame_stage_passed' if unpassed else 'all_stages_passed',
+                step=total, unpassed_stages=unpassed)
 
 
 def check_authority(path, generation, job):
@@ -113,12 +135,16 @@ def main():
     ap.add_argument('--eval-every', type=int, default=100)
     ap.add_argument('--resume', action='store_true')
     ap.add_argument('--resume-from', help='Continue full native state into a new output directory')
+    ap.add_argument('--advance-to-five-frames', action='store_true',
+                    help='With resume-from, explicitly leave an exhausted one-frame gate failed')
     ap.add_argument('--authority-file', help='Atomic job-specific grant checked before batches and saves')
     ap.add_argument('--authority-generation', type=int)
     ap.add_argument('--preflight', action='store_true', help='Check selected files without loading a model')
     a = ap.parse_args()
     if a.resume and a.resume_from:
         ap.error('--resume and --resume-from are mutually exclusive')
+    if a.advance_to_five_frames and not a.resume_from:
+        ap.error('--advance-to-five-frames requires --resume-from')
     if bool(a.authority_file) != (a.authority_generation is not None):
         ap.error('Provide both authority-file and authority-generation')
     def guard():
@@ -160,7 +186,7 @@ def main():
         print(json.dumps(dict(preflight='passed', frames=len(ds.rows), files=len(files))), flush=True)
         return
     config_record = {k:v for k,v in vars(a).items() if k not in (
-        'resume','resume_from','preflight','authority_file','authority_generation')}
+        'resume','resume_from','advance_to_five_frames','preflight','authority_file','authority_generation')}
     config_record['world_size'] = world
     config_record['versions'] = {
         k:importlib.metadata.version(k) for k in ('torch','diffusers','peft','transformers')}
@@ -248,8 +274,13 @@ def main():
         noise_rng.set_state(state['ranks'][rank]['noise_rng'].cpu())
         continuation = state.get('continuation')
         if a.resume_from:
+            unpassed = list((continuation or {}).get('unpassed_stages', []))
+            if a.advance_to_five_frames:
+                unpassed.append(advance_after_budget(state, cp))
+                stage, stage_step = 3, 0
             continuation = dict(source=str(cp), source_manifest=json.loads((cp/'manifest.json').read_text()),
-                previous_config=state['config'], config=config_record, previous=continuation)
+                previous_config=state['config'], config=config_record, previous=continuation,
+                unpassed_stages=unpassed)
             if rank==0:
                 atomic_json(out/'continuation.json',continuation)
             # Save restored native state here before evaluating or updating it.
@@ -371,7 +402,7 @@ def main():
             pending=True
             commit()  # Evaluation must never precede a complete resumable save.
     if stage==len(STAGES) and rank==0:
-        atomic_json(out/'status.json',dict(status='all_stages_passed',step=total))
+        atomic_json(out/'status.json',completion_status(continuation,total))
     if world>1: dist.destroy_process_group()
 
 

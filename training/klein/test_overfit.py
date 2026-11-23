@@ -10,11 +10,36 @@ import numpy as np
 import torch
 
 import checkpointing as ck
-from overfit import check_authority, evaluate_checkpoint, flow_loss, training_case, validate_continuation
+from overfit import (advance_after_budget, check_authority, completion_status,
+                     evaluate_checkpoint, flow_loss, training_case, validate_continuation)
 from overfit_runtime import euler_sample, predict_velocity
 
 
 class OverfitTests(unittest.TestCase):
+    def test_stage_advance_preserves_failed_gate_through_checkpoint_and_completion(self):
+        state = dict(stage=2,stage_step=6000,total=7800,
+                     config=dict(budgets='2000,4000,6000,10000',threshold=.001))
+        result = dict(stage='one_sigma_grid',stage_step=6000,step=7800,max_v=.0068)
+        with tempfile.TemporaryDirectory() as root:
+            cp=Path(root)/'source';cp.mkdir()
+            with self.assertRaises(FileNotFoundError):
+                advance_after_budget(state,cp)
+            ck.atomic_json(cp/'evaluation.json',result)
+            failure=advance_after_budget(state,cp)
+            continuation=dict(unpassed_stages=[failure])
+            ck.save_checkpoint(Path(root)/'next',7800,dict(continuation=continuation))
+            restored,_=ck.load_checkpoint(Path(root)/'next')
+            status=completion_status(restored['continuation'],9000)
+            self.assertEqual(status['status'],'five_frame_stage_passed')
+            self.assertFalse(status['unpassed_stages'][0]['passed'])
+            self.assertEqual(status['unpassed_stages'][0]['max_v'],.0068)
+            self.assertEqual(completion_status(None,9000)['status'],'all_stages_passed')
+            for changed in (dict(state,stage=1),dict(state,stage=3),dict(state,stage_step=5900)):
+                with self.assertRaises(ValueError):advance_after_budget(changed,cp)
+            for changed in (dict(result,step=7700),dict(result,max_v=.0009),dict(result,max_v=float('nan'))):
+                ck.atomic_json(cp/'evaluation.json',changed)
+                with self.assertRaises(ValueError):advance_after_budget(state,cp)
+
     def test_continuation_changes_paths_and_budgets_without_changing_recipe(self):
         old = dict(data='old_data',out='old_out',budgets='2,4,6,10',lr=.001,world_size=2)
         new = dict(old,data='new_data',out='new_out',budgets='2,4,16,20')

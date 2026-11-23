@@ -56,6 +56,15 @@ does not restart training or skip a failed gate. Data hashes, world size and
 scientific settings must match. Changed paths and increased budgets are recorded
 in `continuation.json`. Use `--resume` for later recovery of that continuation.
 
+To run the five-frame experiment after the one-frame sigma stage exhausts its
+budget, explicitly add `--advance-to-five-frames` to `--resume-from`. This
+requires the source's committed evaluation and records the unpassed gate in
+`continuation.json` and every subsequent native checkpoint. Weights, Adam and
+rank RNG streams are restored; the five-frame stage begins at its own step zero.
+The earlier gate remains failed. Even if the five-frame stage passes, final
+status is `five_frame_stage_passed`, never `all_stages_passed`. Report this
+curriculum change alongside both stages' results.
+
 Cluster launchers can provide `--authority-file` and `--authority-generation`.
 The JSON grant must authorize the current `SLURM_JOB_ID` with `selected_job`,
 `generation`, and `release_training=true`. Checks precede each batch, optimizer
