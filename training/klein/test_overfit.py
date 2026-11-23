@@ -2,6 +2,8 @@
 import json
 from pathlib import Path
 import random
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -16,6 +18,19 @@ from overfit_runtime import euler_sample, predict_velocity
 
 
 class OverfitTests(unittest.TestCase):
+    def test_command_authority_reads_revocation_and_fails_closed(self):
+        with tempfile.TemporaryDirectory() as root:
+            root=Path(root);source=root/'original.json';command=root/'command.json'
+            ck.atomic_json(source,dict(generation=3,selected_job='123',release_training=True))
+            ck.atomic_json(command,[sys.executable,'-c',
+                'from pathlib import Path;import sys;print(Path(sys.argv[1]).read_text())',str(source)])
+            guard=lambda:check_authority(None,3,'123',command)
+            guard()
+            ck.atomic_json(source,dict(generation=4,selected_job='456',release_training=True))
+            with self.assertRaises(RuntimeError):guard()
+            ck.atomic_json(command,[sys.executable,'-c','raise SystemExit(7)'])
+            with self.assertRaises(subprocess.CalledProcessError):guard()
+
     def test_stage_advance_preserves_failed_gate_through_checkpoint_and_completion(self):
         state = dict(stage=2,stage_step=6000,total=7800,
                      config=dict(budgets='2000,4000,6000,10000',threshold=.001))

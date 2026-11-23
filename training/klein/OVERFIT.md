@@ -70,6 +70,10 @@ The JSON grant must authorize the current `SLURM_JOB_ID` with `selected_job`,
 `generation`, and `release_training=true`. Checks precede each batch, optimizer
 update and checkpoint publication. Cross-site launchers must coordinate these
 grants through one authority and isolate each successor's output directory.
+When that authority lives on another host, use `--authority-command-file`
+instead of a local grant copy: a JSON argv list runs without a shell at every
+check and must return the original grant as JSON. Failed or timed-out reads
+stop the worker. The launcher supplies authentication and any required relay.
 
 Each GPU processes one example per optimizer update, and gradients are averaged
 across GPUs. In the first stage both ranks deliberately use the same example,

@@ -20,6 +20,7 @@ from pathlib import Path
 import random
 import re
 import signal
+import subprocess
 import time
 
 import numpy as np
@@ -68,10 +69,17 @@ def completion_status(continuation, total):
                 step=total, unpassed_stages=unpassed)
 
 
-def check_authority(path, generation, job):
-    if not path:
+def check_authority(path, generation, job, command_file=None):
+    if not path and not command_file:
         return
-    grant = json.loads(Path(path).read_text())
+    if command_file:
+        command = json.loads(Path(command_file).read_text())
+        if not isinstance(command, list) or not command or not all(isinstance(x, str) for x in command):
+            raise ValueError('Authority command must be a nonempty JSON argv list')
+        result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=30)
+        grant = json.loads(result.stdout)
+    else:
+        grant = json.loads(Path(path).read_text())
     if not (grant.get('release_training') is True and
             grant.get('generation') == generation and
             grant.get('selected_job') == job and job):
@@ -138,6 +146,8 @@ def main():
     ap.add_argument('--advance-to-five-frames', action='store_true',
                     help='With resume-from, explicitly leave an exhausted one-frame gate failed')
     ap.add_argument('--authority-file', help='Atomic job-specific grant checked before batches and saves')
+    ap.add_argument('--authority-command-file',
+                    help='JSON argv for reading the original cross-site grant on every check')
     ap.add_argument('--authority-generation', type=int)
     ap.add_argument('--preflight', action='store_true', help='Check selected files without loading a model')
     a = ap.parse_args()
@@ -145,10 +155,13 @@ def main():
         ap.error('--resume and --resume-from are mutually exclusive')
     if a.advance_to_five_frames and not a.resume_from:
         ap.error('--advance-to-five-frames requires --resume-from')
-    if bool(a.authority_file) != (a.authority_generation is not None):
-        ap.error('Provide both authority-file and authority-generation')
+    if a.authority_file and a.authority_command_file:
+        ap.error('Choose a grant file or a grant-reading command')
+    if bool(a.authority_file or a.authority_command_file) != (a.authority_generation is not None):
+        ap.error('Provide an authority source and authority-generation together')
     def guard():
-        check_authority(a.authority_file,a.authority_generation,os.getenv('SLURM_JOB_ID'))
+        check_authority(a.authority_file,a.authority_generation,os.getenv('SLURM_JOB_ID'),
+                        a.authority_command_file)
     guard()
     if not re.fullmatch(r'[0-9a-f]{40}', a.revision):
         raise ValueError('Use a full immutable foundation commit SHA')
@@ -186,7 +199,8 @@ def main():
         print(json.dumps(dict(preflight='passed', frames=len(ds.rows), files=len(files))), flush=True)
         return
     config_record = {k:v for k,v in vars(a).items() if k not in (
-        'resume','resume_from','advance_to_five_frames','preflight','authority_file','authority_generation')}
+        'resume','resume_from','advance_to_five_frames','preflight','authority_file',
+        'authority_command_file','authority_generation')}
     config_record['world_size'] = world
     config_record['versions'] = {
         k:importlib.metadata.version(k) for k in ('torch','diffusers','peft','transformers')}
